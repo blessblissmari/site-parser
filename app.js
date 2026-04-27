@@ -1,7 +1,8 @@
 // Site Parser — client-side static app.
 // Step 1: fetch a page via CORS proxy, render it sandboxed in an iframe with an overlay
-// that lets the user click blocks. Step 2: collect generalized CSS selectors. Step 3:
-// BFS crawl same-origin pages, apply selectors, output a single TXT file.
+// that lets the user click blocks. Step 2: collect generalized CSS selectors with a
+// per-selector output format (auto-suggested from the clicked element). Step 3: BFS
+// crawl same-origin pages, apply selectors, output a single TXT file.
 
 (() => {
   "use strict";
@@ -25,13 +26,150 @@
   const stopBtn = $("stopBtn");
   const logEl = $("log");
 
+  // ----- Format catalog -----
+  // Each format defines how the extracted nodes for a selector are turned into text lines.
+  // `extract(node)` returns an array of strings (one or more lines) for a single matched node.
+  const FORMATS = {
+    text: {
+      label: "Текст",
+      extract: (n) => {
+        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+        return t ? [t] : [];
+      },
+    },
+    lines: {
+      label: "Текст построчно",
+      extract: (n) => {
+        // preserve <br> and block boundaries as line breaks
+        const html = n.innerHTML
+          .replace(/<\s*br\s*\/?\s*>/gi, "\n")
+          .replace(/<\/(p|div|li|tr|h[1-6])>/gi, "\n</$1>");
+        const tmp = n.ownerDocument.createElement("div");
+        tmp.innerHTML = html;
+        return (tmp.textContent || "")
+          .split(/\n+/)
+          .map((s) => s.replace(/\s+/g, " ").trim())
+          .filter(Boolean);
+      },
+    },
+    list: {
+      label: "Список",
+      extract: (n) => {
+        const items = [...n.querySelectorAll(":scope > li, :scope li")];
+        const seen = new Set();
+        const out = [];
+        items.forEach((li) => {
+          // skip nested li already counted (querySelectorAll returns descendants in order;
+          // dedupe by exact element identity – Set handles it)
+          if (seen.has(li)) return;
+          seen.add(li);
+          const t = (li.textContent || "").replace(/\s+/g, " ").trim();
+          if (t) out.push(`- ${t}`);
+        });
+        if (!out.length) {
+          const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+          if (t) out.push(`- ${t}`);
+        }
+        return out;
+      },
+    },
+    kv: {
+      label: "Таблица: ключ → значение",
+      extract: (n) => {
+        const out = [];
+        // <table>: try header row + rows, or 2-column rows
+        n.querySelectorAll("tr").forEach((tr) => {
+          const cells = [...tr.querySelectorAll("th, td")].map((c) =>
+            (c.textContent || "").replace(/\s+/g, " ").trim()
+          );
+          if (cells.length === 2 && cells[0] && cells[1]) {
+            out.push(`${cells[0]}: ${cells[1]}`);
+          } else if (cells.length > 2) {
+            out.push(cells.join(" | "));
+          }
+        });
+        // <dl>: dt/dd pairs
+        const dts = [...n.querySelectorAll("dt")];
+        dts.forEach((dt) => {
+          const dd = dt.nextElementSibling;
+          if (dd && dd.tagName.toLowerCase() === "dd") {
+            const k = (dt.textContent || "").replace(/\s+/g, " ").trim();
+            const v = (dd.textContent || "").replace(/\s+/g, " ").trim();
+            if (k && v) out.push(`${k}: ${v}`);
+          }
+        });
+        // Pattern: heading/strong followed by sibling text (e.g. spec lists)
+        if (!out.length) {
+          [...n.children].forEach((child) => {
+            const label = child.querySelector("strong, b, dt, h1, h2, h3, h4, h5, h6, .label, .spec-name, .name");
+            if (!label) return;
+            const k = (label.textContent || "").replace(/\s+/g, " ").trim();
+            const clone = child.cloneNode(true);
+            const labelInClone = clone.querySelector("strong, b, dt, h1, h2, h3, h4, h5, h6, .label, .spec-name, .name");
+            if (labelInClone) labelInClone.remove();
+            const v = (clone.textContent || "").replace(/\s+/g, " ").trim();
+            if (k && v) out.push(`${k}: ${v}`);
+          });
+        }
+        if (!out.length) {
+          const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+          if (t) out.push(t);
+        }
+        return out;
+      },
+    },
+    links: {
+      label: "Ссылки (текст — URL)",
+      extract: (n) => {
+        const anchors = n.tagName.toLowerCase() === "a" ? [n] : [...n.querySelectorAll("a[href]")];
+        return anchors
+          .map((a) => {
+            const text = (a.textContent || "").replace(/\s+/g, " ").trim();
+            const href = a.getAttribute("href") || "";
+            if (!href) return null;
+            return text ? `${text} — ${href}` : href;
+          })
+          .filter(Boolean);
+      },
+    },
+    image: {
+      label: "Картинки (alt — URL)",
+      extract: (n) => {
+        const imgs = n.tagName.toLowerCase() === "img" ? [n] : [...n.querySelectorAll("img")];
+        return imgs
+          .map((img) => {
+            const alt = (img.getAttribute("alt") || "").replace(/\s+/g, " ").trim();
+            const src = img.getAttribute("src") || "";
+            if (!src) return null;
+            return alt ? `${alt} — ${src}` : src;
+          })
+          .filter(Boolean);
+      },
+    },
+    json: {
+      label: "JSON {tag, text, attrs}",
+      extract: (n) => {
+        const obj = {
+          tag: n.tagName.toLowerCase(),
+          text: (n.textContent || "").replace(/\s+/g, " ").trim(),
+        };
+        const attrs = {};
+        for (const a of n.attributes) {
+          if (a.name === "style" || a.name.startsWith("on") || a.name.startsWith("__sp")) continue;
+          attrs[a.name] = a.value;
+        }
+        if (Object.keys(attrs).length) obj.attrs = attrs;
+        return [JSON.stringify(obj)];
+      },
+    },
+  };
+
   // ----- State -----
-  let currentUrl = null;       // last successfully loaded URL
-  let currentHtml = null;      // raw HTML of that page (without our injected overlay)
-  let selectors = [];          // [{ selector, count }]
+  let currentUrl = null;
+  let currentHtml = null;
+  let selectors = []; // [{ selector, count, format }]
   let crawlAbort = false;
 
-  // ----- Logging -----
   function log(msg, kind) {
     const span = document.createElement("span");
     if (kind) span.className = kind;
@@ -67,40 +205,26 @@
     return text;
   }
 
-  // ----- HTML preparation -----
-  // Strip scripts and inline event handlers to keep the iframe under our control,
-  // then inject <base href> for relative URLs and our overlay script.
   function prepareHtml(rawHtml, baseUrl) {
     const doc = new DOMParser().parseFromString(rawHtml, "text/html");
-
-    // Remove scripts and noscript blocks
     doc.querySelectorAll("script, noscript").forEach((n) => n.remove());
-
-    // Remove inline event handlers (onclick=, etc) and javascript: hrefs
     doc.querySelectorAll("*").forEach((el) => {
       [...el.attributes].forEach((a) => {
         if (/^on/i.test(a.name)) el.removeAttribute(a.name);
         if (a.name === "href" && /^\s*javascript:/i.test(a.value)) el.setAttribute("href", "#");
       });
     });
-
-    // Ensure <head> exists
     if (!doc.head) {
       const head = doc.createElement("head");
       doc.documentElement.insertBefore(head, doc.documentElement.firstChild);
     }
-
-    // Insert <base href> first so relative links/images resolve against the original origin
     const existingBase = doc.querySelector("base");
     if (existingBase) existingBase.remove();
     const base = doc.createElement("base");
     base.setAttribute("href", baseUrl);
     doc.head.insertBefore(base, doc.head.firstChild);
-
-    // Force every link to open in a new tab so the iframe doesn't navigate
     doc.querySelectorAll("a[href]").forEach((a) => a.setAttribute("target", "_blank"));
 
-    // Inject overlay style + script
     const style = doc.createElement("style");
     style.textContent = `
       .__sp-hover { outline: 2px solid #4f8cff !important; outline-offset: 0 !important; cursor: crosshair !important; }
@@ -112,24 +236,23 @@
     const script = doc.createElement("script");
     script.textContent = OVERLAY_SCRIPT;
     doc.body.appendChild(script);
-
     return "<!doctype html>\n" + doc.documentElement.outerHTML;
   }
 
-  // This script runs INSIDE the sandboxed iframe (allow-scripts only, opaque origin).
-  // It sends messages to the parent via window.parent.postMessage.
+  // Runs INSIDE the sandboxed iframe (allow-scripts only, opaque origin).
+  // Detects element type and posts a message with selector, count, suggested format,
+  // and a small preview snippet so the parent can pre-fill the UI.
   const OVERLAY_SCRIPT = `
     (function () {
       var lastHover = null;
-      function isOurOverlay(el) { return false; }
+
       function getCssPath(el) {
         if (!el || el.nodeType !== 1) return "";
         var path = [];
         while (el && el.nodeType === 1 && el !== document.body && el !== document.documentElement && path.length < 6) {
           var seg = el.tagName.toLowerCase();
           if (el.id && /^[a-zA-Z][\\w-]*$/.test(el.id)) {
-            seg = "#" + el.id;
-            path.unshift(seg);
+            path.unshift("#" + el.id);
             break;
           }
           var classes = (el.className && typeof el.className === "string" ? el.className : "")
@@ -139,7 +262,7 @@
               return /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(c)
                 && !/^(active|open|hover|focus|selected|disabled|hidden|visible|show|in|fade|sp-|__sp-)/i.test(c)
                 && !/^(css-[a-f0-9]+|sc-[a-z0-9]+|jss\\d+|MuiBox-root|chakra-)/i.test(c)
-                && !/^[a-z]+_[a-zA-Z0-9_-]+__[a-zA-Z0-9_-]+$/.test(c) // CSS modules hash
+                && !/^[a-z]+_[a-zA-Z0-9_-]+__[a-zA-Z0-9_-]+$/.test(c)
                 && !/\\d{3,}/.test(c);
             })
             .slice(0, 2);
@@ -149,6 +272,37 @@
         }
         return path.join(" > ");
       }
+
+      function suggestFormat(el) {
+        if (!el) return "text";
+        var tag = el.tagName.toLowerCase();
+        if (tag === "table") return "kv";
+        if (tag === "dl") return "kv";
+        if (tag === "ul" || tag === "ol") return "list";
+        if (tag === "a") return "links";
+        if (tag === "img") return "image";
+        // Specific by content
+        if (el.querySelector && el.querySelector("table")) return "kv";
+        if (el.querySelector && el.querySelector("dl, dt")) return "kv";
+        // ≥2 dt / th cells → looks like a spec table
+        if (el.querySelectorAll && el.querySelectorAll("dt, th").length >= 2) return "kv";
+        if (el.querySelector && (el.querySelector("ul") || el.querySelector("ol"))) return "list";
+        if (el.querySelectorAll && el.querySelectorAll("a[href]").length >= 3) return "links";
+        if (el.querySelectorAll && el.querySelectorAll("img").length >= 2) return "image";
+        // Class hints (specs / characteristics / params)
+        var cls = (el.className && typeof el.className === "string" ? el.className : "").toLowerCase();
+        if (/(spec|characteristic|features?|params?|attributes?|properties?|details?|info|prop)/.test(cls)) return "kv";
+        if (/(list|items?|menu|nav)/.test(cls)) return "list";
+        // Repeated label/value siblings
+        if (el.querySelectorAll && el.querySelectorAll(":scope > * > strong, :scope > * > b").length >= 2) return "kv";
+        return "text";
+      }
+
+      function preview(el) {
+        var t = (el.textContent || "").replace(/\\s+/g, " ").trim();
+        return t.length > 120 ? t.slice(0, 120) + "…" : t;
+      }
+
       document.addEventListener("mouseover", function (e) {
         if (lastHover) lastHover.classList.remove("__sp-hover");
         lastHover = e.target;
@@ -163,14 +317,22 @@
         e.stopPropagation();
         var sel = getCssPath(e.target);
         try {
-          var matches = sel ? document.querySelectorAll(sel).length : 0;
-          document.querySelectorAll(sel).forEach(function (n) { n.classList.add("__sp-picked"); });
-          window.parent.postMessage({ __sp: true, type: "pick", selector: sel, count: matches }, "*");
+          var matches = sel ? document.querySelectorAll(sel) : [];
+          matches.forEach(function (n) { n.classList.add("__sp-picked"); });
+          window.parent.postMessage({
+            __sp: true,
+            type: "pick",
+            selector: sel,
+            count: matches.length,
+            tag: e.target.tagName.toLowerCase(),
+            suggested: suggestFormat(e.target),
+            preview: preview(e.target),
+          }, "*");
         } catch (err) {
           window.parent.postMessage({ __sp: true, type: "error", message: String(err) }, "*");
         }
       }, true);
-      // Notify parent that overlay is ready
+
       window.parent.postMessage({ __sp: true, type: "ready", title: document.title || "" }, "*");
     })();
   `;
@@ -202,11 +364,14 @@
     }
   }
 
-  // ----- Selector list -----
+  // ----- Selector list rendering -----
   function renderSelectors() {
     selectorsList.innerHTML = "";
     selectors.forEach((s, idx) => {
       const li = document.createElement("li");
+
+      const top = document.createElement("div");
+      top.className = "sel-row";
       const code = document.createElement("code");
       code.textContent = s.selector;
       const cnt = document.createElement("span");
@@ -220,20 +385,53 @@
       del.textContent = "×";
       del.title = "Удалить";
       del.onclick = () => { selectors.splice(idx, 1); renderSelectors(); };
-      li.append(code, cnt, up, del);
+      top.append(code, cnt, up, del);
+
+      const fmt = document.createElement("div");
+      fmt.className = "sel-row sel-fmt";
+      const label = document.createElement("label");
+      label.textContent = "формат:";
+      label.className = "muted small";
+      const sel = document.createElement("select");
+      Object.entries(FORMATS).forEach(([key, def]) => {
+        const opt = document.createElement("option");
+        opt.value = key;
+        opt.textContent = def.label;
+        if (key === s.format) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      sel.onchange = () => { s.format = sel.value; renderSelectors(); };
+      const auto = document.createElement("span");
+      auto.className = "muted small";
+      if (s.suggestedTag) auto.textContent = `авто: <${s.suggestedTag}>`;
+      fmt.append(label, sel, auto);
+
+      li.append(top, fmt);
+      if (s.preview) {
+        const pv = document.createElement("div");
+        pv.className = "sel-preview muted small";
+        pv.textContent = s.preview;
+        li.appendChild(pv);
+      }
       selectorsList.appendChild(li);
     });
   }
 
-  function addSelector(sel, count) {
+  function addSelector(payload) {
+    const sel = payload.selector;
     if (!sel) return;
     if (selectors.some((s) => s.selector === sel)) return;
-    selectors.push({ selector: sel, count: count || 0 });
+    selectors.push({
+      selector: sel,
+      count: payload.count || 0,
+      format: payload.suggested || "text",
+      suggestedTag: payload.tag || "",
+      preview: payload.preview || "",
+    });
     renderSelectors();
-    log(`+ ${sel} (на странице: ${count})`, "info");
+    log(`+ ${sel} (на странице: ${payload.count}, формат: ${FORMATS[payload.suggested]?.label || "Текст"})`, "info");
   }
 
-  // Broaden: drop the last segment of the descendant chain.
   function broaden(idx) {
     const s = selectors[idx];
     if (!s) return;
@@ -241,11 +439,6 @@
     if (parts.length <= 1) return;
     parts.pop();
     s.selector = parts.join(" > ");
-    // Re-count via the iframe document if we can reach it; otherwise leave as-is.
-    try {
-      const doc = frame.contentDocument;
-      if (doc) s.count = doc.querySelectorAll(s.selector).length;
-    } catch { /* opaque origin: cannot read */ }
     renderSelectors();
   }
 
@@ -254,7 +447,7 @@
   window.addEventListener("message", (e) => {
     const data = e.data;
     if (!data || !data.__sp) return;
-    if (data.type === "pick") addSelector(data.selector, data.count);
+    if (data.type === "pick") addSelector(data);
     else if (data.type === "ready") log(`Превью готово: ${data.title || ""}`);
     else if (data.type === "error") log(`Iframe error: ${data.message}`, "err");
   });
@@ -263,20 +456,23 @@
   urlInput.addEventListener("keydown", (e) => { if (e.key === "Enter") loadPage(); });
 
   // ----- Crawler -----
-  function extractTextBySelectors(html, sels) {
+  function extractFromHtml(html, sels) {
     const doc = new DOMParser().parseFromString(html, "text/html");
-    // Remove non-content tags so innerText-like extraction is cleaner
     doc.querySelectorAll("script, style, noscript, svg").forEach((n) => n.remove());
-    const out = [];
-    for (const sel of sels) {
+    const sections = []; // [{ selector, format, lines }]
+    for (const s of sels) {
+      const fmt = FORMATS[s.format] || FORMATS.text;
       let nodes;
-      try { nodes = doc.querySelectorAll(sel); } catch { continue; }
+      try { nodes = [...doc.querySelectorAll(s.selector)]; } catch { continue; }
+      const lines = [];
       nodes.forEach((n) => {
-        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-        if (t) out.push(t);
+        const out = fmt.extract(n);
+        if (Array.isArray(out)) lines.push(...out);
+        else if (out) lines.push(String(out));
       });
+      sections.push({ selector: s.selector, format: s.format, label: fmt.label, lines });
     }
-    return out;
+    return sections;
   }
 
   function extractLinks(html, baseUrl) {
@@ -308,7 +504,7 @@
     const delay = Math.max(0, parseInt(delayInput.value, 10) || 0);
     const sameOrigin = sameOriginInput.checked;
     const includeUrls = includeUrlsInput.checked;
-    const sels = selectors.map((s) => s.selector);
+    const sels = selectors.map((s) => ({ selector: s.selector, format: s.format }));
 
     crawlAbort = false;
     crawlBtn.disabled = true;
@@ -316,7 +512,7 @@
 
     const visited = new Set();
     const queue = [{ url: start, depth: 0 }];
-    const results = []; // { url, lines: string[] }
+    const results = []; // { url, sections }
 
     log(`Старт обхода: ${start} (глубина=${maxDepth}, страниц=${maxPages}, селекторов=${sels.length})`, "info");
 
@@ -334,9 +530,10 @@
         continue;
       }
 
-      const lines = extractTextBySelectors(html, sels);
-      results.push({ url, lines });
-      log(`✓ ${url} — блоков: ${lines.length}`, "ok");
+      const sections = extractFromHtml(html, sels);
+      const total = sections.reduce((a, s) => a + s.lines.length, 0);
+      results.push({ url, sections });
+      log(`✓ ${url} — строк: ${total}`, "ok");
 
       if (depth < maxDepth) {
         const links = extractLinks(html, url);
@@ -369,7 +566,12 @@
         parts.push(`URL: ${r.url}`);
         parts.push("=".repeat(80));
       }
-      for (const line of r.lines) parts.push(line);
+      for (const sec of r.sections) {
+        if (sec.lines.length === 0) continue;
+        parts.push(`-- ${sec.label} [${sec.selector}] --`);
+        for (const line of sec.lines) parts.push(line);
+        parts.push("");
+      }
       parts.push("");
     }
     const blob = new Blob([parts.join("\n")], { type: "text/plain;charset=utf-8" });
@@ -387,7 +589,6 @@
   crawlBtn.onclick = crawl;
   stopBtn.onclick = () => { crawlAbort = true; log("Останавливаю…"); };
 
-  // Restore last URL
   try {
     const saved = localStorage.getItem("sp:lastUrl");
     if (saved) urlInput.value = saved;
