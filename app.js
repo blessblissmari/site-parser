@@ -275,27 +275,47 @@
 
       function suggestFormat(el) {
         if (!el) return "text";
-        var tag = el.tagName.toLowerCase();
-        if (tag === "table") return "kv";
-        if (tag === "dl") return "kv";
-        if (tag === "ul" || tag === "ol") return "list";
-        if (tag === "a") return "links";
-        if (tag === "img") return "image";
-        // Specific by content
-        if (el.querySelector && el.querySelector("table")) return "kv";
-        if (el.querySelector && el.querySelector("dl, dt")) return "kv";
-        // ≥2 dt / th cells → looks like a spec table
+        // Direct tag check on the clicked element first.
+        var direct = formatForTag(el.tagName.toLowerCase());
+        if (direct) return direct;
+        // Then walk up to 4 ancestors to honour the *context* the user clicked
+        // inside (e.g. clicking a <td> inside a Wikipedia infobox should still
+        // suggest kv because the surrounding <table> is what matters).
+        var node = el.parentElement;
+        var hops = 0;
+        while (node && hops < 4) {
+          var f = formatForTag(node.tagName.toLowerCase());
+          if (f) return f;
+          var clsHint = classHint(node);
+          if (clsHint) return clsHint;
+          node = node.parentElement;
+          hops++;
+        }
+        // Fall back to inspecting descendants/structure of the clicked element.
+        if (el.querySelector && el.querySelector("table, dl")) return "kv";
         if (el.querySelectorAll && el.querySelectorAll("dt, th").length >= 2) return "kv";
         if (el.querySelector && (el.querySelector("ul") || el.querySelector("ol"))) return "list";
         if (el.querySelectorAll && el.querySelectorAll("a[href]").length >= 3) return "links";
         if (el.querySelectorAll && el.querySelectorAll("img").length >= 2) return "image";
-        // Class hints (specs / characteristics / params)
-        var cls = (el.className && typeof el.className === "string" ? el.className : "").toLowerCase();
-        if (/(spec|characteristic|features?|params?|attributes?|properties?|details?|info|prop)/.test(cls)) return "kv";
-        if (/(list|items?|menu|nav)/.test(cls)) return "list";
-        // Repeated label/value siblings
+        var ownHint = classHint(el);
+        if (ownHint) return ownHint;
+        // Repeated label/value siblings → looks like a spec block
         if (el.querySelectorAll && el.querySelectorAll(":scope > * > strong, :scope > * > b").length >= 2) return "kv";
         return "text";
+      }
+      function formatForTag(tag) {
+        if (tag === "table" || tag === "tbody" || tag === "thead" || tag === "tfoot" || tag === "tr" || tag === "th" || tag === "td" || tag === "dl" || tag === "dt" || tag === "dd") return "kv";
+        if (tag === "ul" || tag === "ol" || tag === "li") return "list";
+        if (tag === "a") return "links";
+        if (tag === "img" || tag === "figure") return "image";
+        return null;
+      }
+      function classHint(node) {
+        var cls = (node.className && typeof node.className === "string" ? node.className : "").toLowerCase();
+        if (!cls) return null;
+        if (/(infobox|spec|characteristic|features?|params?|attributes?|properties?|details?|prop)/.test(cls)) return "kv";
+        if (/(\\blist\\b|\\bitems?\\b|\\bmenu\\b|\\bnav\\b)/.test(cls)) return "list";
+        return null;
       }
 
       function preview(el) {
@@ -312,10 +332,29 @@
         if (lastHover) lastHover.classList.remove("__sp-hover");
         lastHover = null;
       }, true);
+      // When the user clicks deep inside a structured container (a <td> inside
+      // a <table>, an <li> inside a <ul>, etc.) we want to pick the container
+      // itself so the extracted output is the whole structured block, not a
+      // leaf cell.
+      function findContainer(el) {
+        var node = el;
+        var hops = 0;
+        while (node && hops < 4) {
+          var tag = node.tagName.toLowerCase();
+          if (tag === "table" || tag === "dl" || tag === "ul" || tag === "ol" || tag === "figure") return node;
+          var cls = (node.className && typeof node.className === "string" ? node.className : "").toLowerCase();
+          if (/(infobox|spec|characteristic|features?|params?|attributes?|properties?|details?)/.test(cls)) return node;
+          node = node.parentElement;
+          hops++;
+        }
+        return el;
+      }
+
       document.addEventListener("click", function (e) {
         e.preventDefault();
         e.stopPropagation();
-        var sel = getCssPath(e.target);
+        var target = findContainer(e.target);
+        var sel = getCssPath(target);
         try {
           var matches = sel ? document.querySelectorAll(sel) : [];
           matches.forEach(function (n) { n.classList.add("__sp-picked"); });
@@ -324,9 +363,9 @@
             type: "pick",
             selector: sel,
             count: matches.length,
-            tag: e.target.tagName.toLowerCase(),
-            suggested: suggestFormat(e.target),
-            preview: preview(e.target),
+            tag: target.tagName.toLowerCase(),
+            suggested: suggestFormat(target),
+            preview: preview(target),
           }, "*");
         } catch (err) {
           window.parent.postMessage({ __sp: true, type: "error", message: String(err) }, "*");
