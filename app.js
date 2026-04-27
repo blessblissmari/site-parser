@@ -337,16 +337,14 @@
       // itself so the extracted output is the whole structured block, not a
       // leaf cell.
       function findContainer(el) {
-        var node = el;
-        var hops = 0;
-        while (node && hops < 4) {
-          var tag = node.tagName.toLowerCase();
-          if (tag === "table" || tag === "dl" || tag === "ul" || tag === "ol" || tag === "figure") return node;
-          var cls = (node.className && typeof node.className === "string" ? node.className : "").toLowerCase();
-          if (/(infobox|spec|characteristic|features?|params?|attributes?|properties?|details?)/.test(cls)) return node;
-          node = node.parentElement;
-          hops++;
-        }
+        if (!el || !el.closest) return el;
+        // Use closest() so we promote regardless of nesting depth (Wikipedia
+        // and similar sites wrap cell contents in spans/links, so a fixed
+        // hop limit could miss the surrounding <table>).
+        var structural = el.closest("table, dl, ul, ol, figure");
+        if (structural) return structural;
+        var hinted = el.closest('[class*="infobox" i], [class*="spec" i], [class*="characteristic" i], [class*="features" i], [class*="feature " i], [class*="params" i], [class*="param " i], [class*="attributes" i], [class*="properties" i], [class*="details" i]');
+        if (hinted) return hinted;
         return el;
       }
 
