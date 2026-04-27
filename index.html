@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Site Parser → TXT</title>
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Site Parser <span class="muted">→ TXT</span></div>
+  <a class="muted small" href="https://github.com/blessblissmari/site-parser" target="_blank" rel="noopener">GitHub</a>
+</header>
+
+<main class="layout">
+  <section class="panel">
+    <div class="step">
+      <h2>1. Адрес сайта</h2>
+      <div class="row">
+        <input id="url" type="url" placeholder="https://example.com/blog" autocomplete="off" />
+        <button id="loadBtn" class="primary">Открыть</button>
+      </div>
+      <div class="row">
+        <label class="muted small">CORS-прокси:</label>
+        <select id="proxy">
+          <option value="corsproxy">corsproxy.io</option>
+          <option value="allorigins">allorigins.win</option>
+          <option value="codetabs">codetabs.com</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="step">
+      <h2>2. Выбранные блоки</h2>
+      <p class="muted small">Кликай в превью по блокам, которые надо парсить. ↑ — расширить (взять родителя), × — удалить.</p>
+      <ul id="selectors" class="selectors"></ul>
+      <div class="row">
+        <button id="clearSelBtn">Очистить</button>
+      </div>
+    </div>
+
+    <div class="step">
+      <h2>3. Обход сайта</h2>
+      <div class="grid">
+        <label>Глубина <input id="depth" type="number" min="0" max="5" value="1" /></label>
+        <label>Макс. страниц <input id="maxPages" type="number" min="1" max="500" value="20" /></label>
+        <label>Задержка, мс <input id="delay" type="number" min="0" max="5000" value="400" /></label>
+        <label class="checkbox"><input id="sameOrigin" type="checkbox" checked /> только этот домен</label>
+        <label class="checkbox"><input id="includeUrls" type="checkbox" checked /> писать URL в TXT</label>
+      </div>
+      <div class="row">
+        <button id="crawlBtn" class="primary">Спарсить и скачать TXT</button>
+        <button id="stopBtn" disabled>Стоп</button>
+      </div>
+    </div>
+
+    <div class="step">
+      <h2>Лог</h2>
+      <pre id="log" class="log"></pre>
+    </div>
+  </section>
+
+  <section class="preview">
+    <div class="preview-header">
+      <span id="previewTitle" class="muted small">Превью появится после загрузки страницы.</span>
+      <span id="status" class="status"></span>
+    </div>
+    <iframe id="frame" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+  </section>
+</main>
+
+<script src="./app.js"></script>
+</body>
+</html>
